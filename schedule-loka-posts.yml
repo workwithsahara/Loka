@@ -1,0 +1,35 @@
+name: Schedule Loka TikTok Posts
+
+on:
+  schedule:
+    # Runs once daily at 00:00 UTC. Adjust the cron if you want a
+    # different time — GitHub Actions cron is always UTC.
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (log only, don't create posts)"
+        type: boolean
+        default: false
+
+jobs:
+  schedule:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Run scheduler
+        env:
+          BUFFER_API_KEY: ${{ secrets.BUFFER_API_KEY }}
+          BUFFER_ORG_ID: ${{ secrets.BUFFER_ORG_ID }}
+          BUFFER_CHANNEL_ID: ${{ secrets.BUFFER_CHANNEL_ID }}
+          GOOGLE_DRIVE_API_KEY: ${{ secrets.GOOGLE_DRIVE_API_KEY }}
+          ROOT_FOLDER_ID: ${{ secrets.ROOT_FOLDER_ID }}
+          DRY_RUN: ${{ inputs.dry_run || 'false' }}
+        run: node schedule-loka-posts.js
