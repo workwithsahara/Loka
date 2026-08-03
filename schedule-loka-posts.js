@@ -91,15 +91,8 @@ async function listDriveImages() {
 // 2. Find the latest already-scheduled due date on the Loka TikTok channel
 async function getLatestScheduledDate() {
   const query = `
-    query GetScheduled($orgId: OrganizationId!, $channelIds: [ChannelId!]) {
-      posts(
-        input: {
-          organizationId: $orgId
-          channelIds: $channelIds
-          statuses: [SCHEDULED]
-        }
-        first: 100
-      ) {
+    query GetScheduled($input: PostsInput!) {
+      posts(input: $input, first: 100) {
         edges {
           node {
             dueAt
@@ -109,10 +102,18 @@ async function getLatestScheduledDate() {
     }
   `;
   const data = await bufferGraphQL(query, {
-    orgId: BUFFER_ORG_ID,
-    channelIds: [BUFFER_CHANNEL_ID],
+    input: {
+      organizationId: BUFFER_ORG_ID,
+      filter: {
+        channelIds: [BUFFER_CHANNEL_ID],
+        status: ["scheduled"],
+      },
+    },
   });
-  const dueDates = (data.posts?.edges || []).map((e) => new Date(e.node.dueAt));
+  const dueDates = (data.posts?.edges || [])
+    .map((e) => e.node.dueAt)
+    .filter(Boolean)
+    .map((d) => new Date(d));
   if (!dueDates.length) return null;
   return new Date(Math.max(...dueDates.map((d) => d.getTime())));
 }
@@ -136,8 +137,16 @@ function addHours(date, hours) {
 async function createPost(image, dueAt) {
   const mutation = `
     mutation CreatePost($input: CreatePostInput!) {
-      postCreate(input: $input) {
-        post { id dueAt }
+      createPost(input: $input) {
+        ... on PostActionSuccess {
+          post { id dueAt }
+        }
+        ... on InvalidInputError { message }
+        ... on UnauthorizedError { message }
+        ... on UnexpectedError { message }
+        ... on RestProxyError { message code }
+        ... on LimitReachedError { message }
+        ... on NotFoundError { message }
       }
     }
   `;
@@ -145,19 +154,27 @@ async function createPost(image, dueAt) {
     organizationId: BUFFER_ORG_ID,
     channelId: BUFFER_CHANNEL_ID,
     text: POST_CAPTION,
-    media: { photo: image.driveViewUrl },
-    scheduling: { type: "SCHEDULED", dueAt: dueAt.toISOString() },
+    assets: [{ image: { url: image.driveViewUrl } }],
+    mode: "customScheduled",
+    schedulingType: "automatic",
+    dueAt: dueAt.toISOString(),
+    metadata: { tiktok: {} },
   };
   if (DRY_RUN) {
     console.log(
-      `[DRY RUN] Would schedule ${image.name} for ${dueAt.toISOString().slice(0, 10)}`
+      `[DRY RUN] Would schedule ${image.name} for ${dueAt.toISOString()}`
     );
     return;
   }
   const data = await bufferGraphQL(mutation, { input });
-  console.log(
-    `Scheduled ${image.name} -> ${data.postCreate.post.dueAt}`
-  );
+  const result = data.createPost;
+  if (result.post) {
+    console.log(`Scheduled ${image.name} -> ${result.post.dueAt}`);
+  } else {
+    throw new Error(
+      `Buffer rejected post for ${image.name}: ${result.message}`
+    );
+  }
 }
 
 async function main() {
