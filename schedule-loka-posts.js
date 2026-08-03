@@ -151,7 +151,6 @@ async function createPost(image, dueAt) {
     }
   `;
   const input = {
-    organizationId: BUFFER_ORG_ID,
     channelId: BUFFER_CHANNEL_ID,
     text: POST_CAPTION,
     assets: [{ image: { url: image.driveViewUrl } }],
