@@ -201,7 +201,7 @@ async function main() {
     `${alreadyScheduledCount} already scheduled. Filling ${slotsToFill} more slot(s), one every ${POST_INTERVAL_HOURS} hours.`
   );
 
-  const now = new Date();
+  const now = new Date(Date.now() + 5 * 60 * 1000); // 5-minute lead buffer so dueAt is always in the future
 
   for (let i = 0; i < slotsToFill; i++) {
     const slotOffset = alreadyScheduledCount + i;
