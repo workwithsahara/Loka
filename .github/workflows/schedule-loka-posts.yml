@@ -2,9 +2,9 @@ name: Schedule Loka TikTok Posts
 
 on:
   schedule:
-    # Runs once daily at 00:00 UTC. Adjust the cron if you want a
-    # different time — GitHub Actions cron is always UTC.
-    - cron: "0 0 * * *"
+    # Runs every 6 hours (00:00, 06:00, 12:00, 18:00 UTC) to keep the
+    # queue topped up in step with the 6-hour posting cadence.
+    - cron: "0 */6 * * *"
   workflow_dispatch:
     inputs:
       dry_run:
