@@ -36,9 +36,10 @@ const ROOT_FOLDER_ID = process.env.ROOT_FOLDER_ID;
 const DRY_RUN = process.env.DRY_RUN === "true";
 const POST_CAPTION = process.env.POST_CAPTION || "Loka";
 
-const BUFFER_GRAPHQL_URL = "https://graph.buffer.com";
+const BUFFER_GRAPHQL_URL = "https://api.buffer.com";
 const DRIVE_API_URL = "https://www.googleapis.com/drive/v3/files";
 const MAX_SCHEDULED_POSTS = 10; // Buffer free-plan cap per channel
+const POST_INTERVAL_HOURS = 6; // one post every 6 hours (4/day)
 
 function assertEnv() {
   const required = {
@@ -116,19 +117,19 @@ async function getLatestScheduledDate() {
   return new Date(Math.max(...dueDates.map((d) => d.getTime())));
 }
 
-function countScheduled(latestDate, images) {
-  // Approximation: if we know the latest scheduled date, assume one
-  // post per day has been scheduled since "today" up to that date.
+function countScheduled(latestDate) {
+  // Approximation: if we know the latest scheduled slot, assume one
+  // post per POST_INTERVAL_HOURS has been scheduled since now up to
+  // that slot.
   if (!latestDate) return 0;
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-  const diffDays = Math.round((latestDate - today) / 86400000);
-  return Math.max(0, diffDays + 1);
+  const now = new Date();
+  const diffHours = Math.round((latestDate - now) / 3600000);
+  return Math.max(0, Math.floor(diffHours / POST_INTERVAL_HOURS) + 1);
 }
 
-function addDays(date, days) {
+function addHours(date, hours) {
   const d = new Date(date);
-  d.setDate(d.getDate() + days);
+  d.setHours(d.getHours() + hours);
   return d;
 }
 
@@ -170,7 +171,7 @@ async function main() {
   console.log(`Found ${images.length} images in the Loka library.`);
 
   const latestScheduled = await getLatestScheduledDate();
-  const alreadyScheduledCount = countScheduled(latestScheduled, images);
+  const alreadyScheduledCount = countScheduled(latestScheduled);
   const slotsToFill = MAX_SCHEDULED_POSTS - alreadyScheduledCount;
 
   if (slotsToFill <= 0) {
@@ -181,17 +182,16 @@ async function main() {
   }
 
   console.log(
-    `${alreadyScheduledCount} already scheduled. Filling ${slotsToFill} more slot(s).`
+    `${alreadyScheduledCount} already scheduled. Filling ${slotsToFill} more slot(s), one every ${POST_INTERVAL_HOURS} hours.`
   );
 
-  const today = new Date();
-  today.setHours(9, 0, 0, 0); // default posting time 9am, adjust as needed
+  const now = new Date();
 
   for (let i = 0; i < slotsToFill; i++) {
-    const dayOffset = alreadyScheduledCount + i;
-    const dueAt = addDays(today, dayOffset);
+    const slotOffset = alreadyScheduledCount + i;
+    const dueAt = addHours(now, slotOffset * POST_INTERVAL_HOURS);
     // Evergreen wrap-around: cycle through the library forever
-    const imageIndex = dayOffset % images.length;
+    const imageIndex = slotOffset % images.length;
     const image = images[imageIndex];
     image.driveViewUrl = `https://drive.google.com/uc?export=view&id=${image.id}`;
     await createPost(image, dueAt);
