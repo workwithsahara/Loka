@@ -1,63 +1,120 @@
+#!/usr/bin/env node
 /**
- * loka-buffer-scheduler
+ * Loka (TikTok) → Buffer queue top-up (TWO TRACKS, ONE CHANNEL)
  * -----------------------------------------------------------------------
- * Evergreen, single-channel (TikTok) Buffer scheduler for the Loka brand.
+ * Manages TWO independent evergreen content tracks on the SAME TikTok
+ * channel, sharing the ONE Buffer queue for that channel:
  *
- * How it works:
- *  1. Lists all images in the Drive root folder, sorted by filename
- *     (q001.png, q002.png, q003.png, ...). This ordered list is the
- *     evergreen content library — it repeats forever once it reaches
- *     the end.
- *  2. Asks Buffer what's already scheduled on the Loka TikTok channel.
- *  3. Fills forward from the latest already-scheduled date (or from
- *     today, if nothing is scheduled yet) up to the channel's live
- *     scheduled-post limit (usually 10 on a free Buffer plan).
- *  4. Mapping rule: the very first time this ever runs, q001 = today,
- *     q002 = tomorrow, etc. Once the library is exhausted, it wraps
- *     back to q001 and keeps going (true evergreen — never runs out).
+ *   MAIN track:   q001.png, q002.png, ... — no caption — every
+ *                 MAIN_INTERVAL_HOURS (default 6h)
+ *   PROMO track:  Day001.png .. Day365.png — fixed marketing caption —
+ *                 every PROMO_INTERVAL_HOURS (default 4h)
  *
- * Required environment variables (set as GitHub repo secrets):
- *   BUFFER_API_KEY       Loka's Buffer personal API key
- *   BUFFER_ORG_ID        62d93da01b88d20cfa1863e7
- *   BUFFER_CHANNEL_ID    6a70d99999afb44349f4dcb6  (sira.ulo.siya, TikTok)
- *   GOOGLE_DRIVE_API_KEY Shared Drive API key (same one used by the other repos)
- *   ROOT_FOLDER_ID       1PRW-dm8eEJpS2794W4gjaUENoTn_jnhT
+ * Buffer caps the TOTAL number of scheduled (not-yet-sent) posts per
+ * channel — it doesn't know or care about "tracks". Running two separate
+ * scripts against the same channel would have them blindly compete for
+ * the same limited slots and clobber each other's scheduling math. This
+ * script avoids that by managing both tracks together in one process:
+ * it reads the channel's current queue ONCE, classifies each existing
+ * post into MAIN or PROMO by comparing its caption text against
+ * PROMO_CAPTION, then interleaves new posts from both tracks in true
+ * chronological order until the shared limit is reached.
  *
+ * Each track has its own fixed EPOCH_START + interval, exactly like the
+ * single-track version — this keeps image selection stateless and
+ * deterministic across runs (no persisted counter needed). Both tracks
+ * currently share the same epoch anchor; only their intervals differ.
+ *
+ * Required environment variables (set as repo/CI secrets):
+ *   BUFFER_API_KEY          Loka's Buffer personal API key
+ *   BUFFER_ORG_ID           Loka's Buffer organization ID
+ *   BUFFER_CHANNEL_ID       Loka's TikTok channel ID
+ *   GOOGLE_DRIVE_API_KEY    API key with Drive API enabled (read-only is fine)
+ *   ROOT_FOLDER_ID          Drive folder for the MAIN track (q001.png, ...)
+ *   PROMO_ROOT_FOLDER_ID    Drive folder for the PROMO track (Day001.png, ...)
+ *   PROMO_CAPTION           Fixed caption text used on every PROMO post
  * Optional:
- *   DRY_RUN=true          Logs planned actions without creating posts
- *   POST_CAPTION          Fixed caption text (defaults to brand name only)
+ *   MAIN_CAPTION           Caption for MAIN track posts (default: empty)
+ *   MAIN_INTERVAL_HOURS    Default 6
+ *   PROMO_INTERVAL_HOURS   Default 4
+ *   DRY_RUN                 "true" to log without creating posts
+ *
+ * Requires Node.js 18+ (uses global fetch).
  */
 
-const BUFFER_API_KEY = process.env.BUFFER_API_KEY;
-const BUFFER_ORG_ID = process.env.BUFFER_ORG_ID;
-const BUFFER_CHANNEL_ID = process.env.BUFFER_CHANNEL_ID;
-const GOOGLE_DRIVE_API_KEY = process.env.GOOGLE_DRIVE_API_KEY;
-const ROOT_FOLDER_ID = process.env.ROOT_FOLDER_ID;
+const BUFFER_API_KEY = requireEnv("BUFFER_API_KEY");
+const ORG_ID = requireEnv("BUFFER_ORG_ID");
+const CHANNEL_ID = requireEnv("BUFFER_CHANNEL_ID");
+const DRIVE_API_KEY = requireEnv("GOOGLE_DRIVE_API_KEY");
+const MAIN_ROOT_FOLDER_ID = requireEnv("ROOT_FOLDER_ID");
+const PROMO_ROOT_FOLDER_ID = requireEnv("PROMO_ROOT_FOLDER_ID");
+const PROMO_CAPTION = requireEnv("PROMO_CAPTION");
+
+const MAIN_CAPTION = process.env.MAIN_CAPTION || "";
+const MAIN_INTERVAL_HOURS = parseInt(process.env.MAIN_INTERVAL_HOURS || "6", 10);
+const PROMO_INTERVAL_HOURS = parseInt(process.env.PROMO_INTERVAL_HOURS || "4", 10);
 const DRY_RUN = process.env.DRY_RUN === "true";
-const POST_CAPTION = process.env.POST_CAPTION || "Loka";
 
-const BUFFER_GRAPHQL_URL = "https://api.buffer.com";
-const DRIVE_API_URL = "https://www.googleapis.com/drive/v3/files";
-const MAX_SCHEDULED_POSTS = 10; // Buffer free-plan cap per channel
-const POST_INTERVAL_HOURS = 6; // one post every 6 hours (4/day)
+// Fixed anchor so image selection is stateless/deterministic across runs
+// for BOTH tracks. Never change this once posts are live, or every
+// future slot's image mapping shifts.
+const EPOCH_START = new Date("2026-08-03T00:00:00Z");
+const LEAD_BUFFER_MS = 5 * 60 * 1000; // 5-minute lead so dueAt is always in the future
 
-function assertEnv() {
-  const required = {
-    BUFFER_API_KEY,
-    BUFFER_ORG_ID,
-    BUFFER_CHANNEL_ID,
-    GOOGLE_DRIVE_API_KEY,
-    ROOT_FOLDER_ID,
-  };
-  const missing = Object.entries(required)
-    .filter(([, v]) => !v)
-    .map(([k]) => k);
-  if (missing.length) {
-    throw new Error(`Missing required env vars: ${missing.join(", ")}`);
+const BUFFER_GRAPHQL_URL = "https://api.buffer.com/graphql";
+
+function requireEnv(name) {
+  const v = process.env[name];
+  if (!v) {
+    console.error(`Missing required environment variable: ${name}`);
+    process.exit(1);
   }
+  return v;
 }
 
-async function bufferGraphQL(query, variables = {}) {
+// ---------------------------------------------------------------------------
+// Google Drive helpers
+// ---------------------------------------------------------------------------
+async function listDriveImages(folderId) {
+  const url = new URL("https://www.googleapis.com/drive/v3/files");
+  url.searchParams.set(
+    "q",
+    `'${folderId}' in parents and mimeType contains 'image/' and trashed = false`
+  );
+  url.searchParams.set("fields", "files(id,name)");
+  url.searchParams.set("pageSize", "1000");
+  url.searchParams.set("key", DRIVE_API_KEY);
+
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error(`Drive file list failed for ${folderId}: ${res.status} ${await res.text()}`);
+  }
+  const data = await res.json();
+  const files = data.files || [];
+  return files.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+}
+
+// ---------------------------------------------------------------------------
+// Track helper (each track = its own interval on the shared epoch)
+// ---------------------------------------------------------------------------
+function makeTrack(intervalHours) {
+  const intervalMs = intervalHours * 3600000;
+  return {
+    intervalHours,
+    intervalMs,
+    slotIndexForTime(date) {
+      return Math.floor((date.getTime() - EPOCH_START.getTime()) / intervalMs);
+    },
+    timeForSlotIndex(slotIndex) {
+      return new Date(EPOCH_START.getTime() + slotIndex * intervalMs);
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Buffer GraphQL helpers
+// ---------------------------------------------------------------------------
+async function bufferRequest(query, variables) {
   const res = await fetch(BUFFER_GRAPHQL_URL, {
     method: "POST",
     headers: {
@@ -66,154 +123,181 @@ async function bufferGraphQL(query, variables = {}) {
     },
     body: JSON.stringify({ query, variables }),
   });
-  const json = await res.json();
-  if (json.errors) {
-    throw new Error(`Buffer API error: ${JSON.stringify(json.errors)}`);
+  const data = await res.json();
+  if (data.errors) {
+    throw new Error(`Buffer API error: ${JSON.stringify(data.errors)}`);
   }
-  return json.data;
+  return data.data;
 }
 
-// 1. List and sort Drive images (q001.png, q002.png, ...)
-async function listDriveImages() {
-  const q = encodeURIComponent(
-    `'${ROOT_FOLDER_ID}' in parents and mimeType contains 'image/' and trashed = false`
-  );
-  const fields = encodeURIComponent("files(id,name)");
-  const url = `${DRIVE_API_URL}?q=${q}&fields=${fields}&pageSize=1000&key=${GOOGLE_DRIVE_API_KEY}`;
-  const res = await fetch(url);
-  const json = await res.json();
-  if (!json.files) {
-    throw new Error(`Drive API error: ${JSON.stringify(json)}`);
-  }
-  return json.files.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
-}
-
-// 2. Find the latest already-scheduled due date on the Loka TikTok channel
-async function getLatestScheduledDate() {
+async function getOrgScheduledPostLimit() {
   const query = `
-    query GetScheduled($input: PostsInput!) {
-      posts(input: $input, first: 100) {
-        edges {
-          node {
-            dueAt
-          }
-        }
+    query Account {
+      account { organizations { id limits { scheduledPosts } } }
+    }
+  `;
+  const data = await bufferRequest(query, {});
+  const org = data.account.organizations.find((o) => o.id === ORG_ID);
+  return org ? org.limits.scheduledPosts : 10;
+}
+
+// Returns [{ dueAt: Date, text: string }] for every currently-scheduled
+// post on the channel, so we can classify each into a track by caption.
+async function getScheduledPosts(channelId) {
+  const query = `
+    query Posts($organizationId: OrganizationId!, $channelIds: [ChannelId!]) {
+      posts(input: { organizationId: $organizationId, filter: { channelIds: $channelIds, status: [scheduled] } }, first: 100) {
+        edges { node { dueAt text } }
       }
     }
   `;
-  const data = await bufferGraphQL(query, {
-    input: {
-      organizationId: BUFFER_ORG_ID,
-      filter: {
-        channelIds: [BUFFER_CHANNEL_ID],
-        status: ["scheduled"],
-      },
-    },
-  });
-  const dueDates = (data.posts?.edges || [])
-    .map((e) => e.node.dueAt)
-    .filter(Boolean)
-    .map((d) => new Date(d));
-  if (!dueDates.length) return null;
-  return new Date(Math.max(...dueDates.map((d) => d.getTime())));
+  const data = await bufferRequest(query, { organizationId: ORG_ID, channelIds: [channelId] });
+  return data.posts.edges.map((e) => ({
+    dueAt: new Date(e.node.dueAt),
+    text: e.node.text || "",
+  }));
 }
 
-function countScheduled(latestDate) {
-  // Approximation: if we know the latest scheduled slot, assume one
-  // post per POST_INTERVAL_HOURS has been scheduled since now up to
-  // that slot.
-  if (!latestDate) return 0;
-  const now = new Date();
-  const diffHours = Math.round((latestDate - now) / 3600000);
-  return Math.max(0, Math.floor(diffHours / POST_INTERVAL_HOURS) + 1);
-}
-
-function addHours(date, hours) {
-  const d = new Date(date);
-  d.setHours(d.getHours() + hours);
-  return d;
-}
-
-async function createPost(image, dueAt) {
+async function createPost({ channelId, fileId, title, dueAtIso }) {
   const mutation = `
     mutation CreatePost($input: CreatePostInput!) {
       createPost(input: $input) {
-        ... on PostActionSuccess {
-          post { id dueAt }
-        }
-        ... on InvalidInputError { message }
-        ... on UnauthorizedError { message }
-        ... on UnexpectedError { message }
-        ... on RestProxyError { message code }
+        ... on PostActionSuccess { post { id status dueAt } }
         ... on LimitReachedError { message }
-        ... on NotFoundError { message }
+        ... on InvalidInputError { message }
+        ... on UnexpectedError { message }
       }
     }
   `;
   const input = {
-    channelId: BUFFER_CHANNEL_ID,
-    text: POST_CAPTION,
-    assets: [{ image: { url: image.driveViewUrl } }],
+    channelId,
     mode: "customScheduled",
     schedulingType: "automatic",
-    dueAt: dueAt.toISOString(),
-    metadata: { tiktok: {} },
+    dueAt: dueAtIso,
+    text: title,
+    assets: [
+      {
+        image: {
+          url: `https://lh3.googleusercontent.com/d/${fileId}`,
+          metadata: { altText: title || "Loka" },
+        },
+      },
+    ],
+    // TikTok doesn't require an explicit "type" the way Facebook/Instagram do.
   };
   if (DRY_RUN) {
-    console.log(
-      `[DRY RUN] Would schedule ${image.name} for ${dueAt.toISOString()}`
-    );
+    console.log(`[DRY RUN] Would create post: dueAt=${dueAtIso} caption="${title}"`);
     return;
   }
-  const data = await bufferGraphQL(mutation, { input });
-  const result = data.createPost;
-  if (result.post) {
-    console.log(`Scheduled ${image.name} -> ${result.post.dueAt}`);
-  } else {
-    throw new Error(
-      `Buffer rejected post for ${image.name}: ${result.message}`
-    );
+  const data = await bufferRequest(mutation, { input });
+  const payload = data.createPost;
+  if (payload.message) {
+    throw new Error(`createPost failed: ${payload.message}`);
   }
+  console.log(`Scheduled: dueAt=${dueAtIso} caption="${title}" -> post ${payload.post.id}`);
 }
 
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
 async function main() {
-  assertEnv();
+  console.log(`Run started ${new Date().toISOString()}${DRY_RUN ? " [DRY RUN]" : ""}`);
 
-  const images = await listDriveImages();
-  if (!images.length) {
-    console.log("No images found in Drive folder. Nothing to do.");
-    return;
-  }
-  console.log(`Found ${images.length} images in the Loka library.`);
+  const mainTrack = makeTrack(MAIN_INTERVAL_HOURS);
+  const promoTrack = makeTrack(PROMO_INTERVAL_HOURS);
 
-  const latestScheduled = await getLatestScheduledDate();
-  const alreadyScheduledCount = countScheduled(latestScheduled);
-  const slotsToFill = MAX_SCHEDULED_POSTS - alreadyScheduledCount;
+  const [mainImages, promoImages] = await Promise.all([
+    listDriveImages(MAIN_ROOT_FOLDER_ID),
+    listDriveImages(PROMO_ROOT_FOLDER_ID),
+  ]);
+  console.log(`MAIN track: ${mainImages.length} images. PROMO track: ${promoImages.length} images.`);
 
-  if (slotsToFill <= 0) {
-    console.log(
-      `Channel already has ${alreadyScheduledCount} scheduled posts (limit ${MAX_SCHEDULED_POSTS}). Nothing to add this run.`
-    );
-    return;
-  }
+  const limit = await getOrgScheduledPostLimit();
+  console.log(`Buffer scheduled-post limit for this channel: ${limit}`);
 
+  const scheduled = await getScheduledPosts(CHANNEL_ID);
+  const mainScheduled = scheduled.filter((p) => p.text !== PROMO_CAPTION);
+  const promoScheduled = scheduled.filter((p) => p.text === PROMO_CAPTION);
   console.log(
-    `${alreadyScheduledCount} already scheduled. Filling ${slotsToFill} more slot(s), one every ${POST_INTERVAL_HOURS} hours.`
+    `Channel ${CHANNEL_ID}: ${scheduled.length}/${limit} total slots used ` +
+      `(MAIN: ${mainScheduled.length}, PROMO: ${promoScheduled.length}).`
   );
 
-  const now = new Date(Date.now() + 5 * 60 * 1000); // 5-minute lead buffer so dueAt is always in the future
+  const nowMainSlot = Math.ceil((Date.now() + LEAD_BUFFER_MS - EPOCH_START.getTime()) / mainTrack.intervalMs);
+  const nowPromoSlot = Math.ceil((Date.now() + LEAD_BUFFER_MS - EPOCH_START.getTime()) / promoTrack.intervalMs);
 
-  for (let i = 0; i < slotsToFill; i++) {
-    const slotOffset = alreadyScheduledCount + i;
-    const dueAt = addHours(now, slotOffset * POST_INTERVAL_HOURS);
-    // Evergreen wrap-around: cycle through the library forever
-    const imageIndex = slotOffset % images.length;
-    const image = images[imageIndex];
-    image.driveViewUrl = `https://drive.google.com/uc?export=view&id=${image.id}`;
-    await createPost(image, dueAt);
+  const latestMainSlot = mainScheduled.length
+    ? Math.max(...mainScheduled.map((p) => mainTrack.slotIndexForTime(p.dueAt)))
+    : -1;
+  const latestPromoSlot = promoScheduled.length
+    ? Math.max(...promoScheduled.map((p) => promoTrack.slotIndexForTime(p.dueAt)))
+    : -1;
+
+  let nextMainSlot = Math.max(nowMainSlot, latestMainSlot + 1);
+  let nextPromoSlot = Math.max(nowPromoSlot, latestPromoSlot + 1);
+
+  const slotsToFill = limit - scheduled.length;
+  if (slotsToFill <= 0) {
+    console.log("Channel already at its scheduled-post limit. Nothing to add this run.");
+    return;
+  }
+  console.log(`Filling ${slotsToFill} more slot(s) total, interleaving MAIN (${MAIN_INTERVAL_HOURS}h) and PROMO (${PROMO_INTERVAL_HOURS}h).`);
+
+  let consecutiveFailures = 0;
+  const MAX_CONSECUTIVE_FAILURES = 3;
+  let filled = 0;
+
+  while (filled < slotsToFill) {
+    const mainCandidateTime = mainTrack.timeForSlotIndex(nextMainSlot);
+    const promoCandidateTime = promoTrack.timeForSlotIndex(nextPromoSlot);
+
+    // Whichever track's next slot is chronologically earlier goes first —
+    // this is what naturally interleaves the two cadences into one queue.
+    const useMain = mainCandidateTime.getTime() <= promoCandidateTime.getTime();
+
+    let fileId, title, dueAt, trackLabel;
+    if (useMain) {
+      const imageIndex = ((nextMainSlot % mainImages.length) + mainImages.length) % mainImages.length;
+      fileId = mainImages[imageIndex].id;
+      title = MAIN_CAPTION;
+      dueAt = mainCandidateTime;
+      trackLabel = "MAIN";
+    } else {
+      const imageIndex = ((nextPromoSlot % promoImages.length) + promoImages.length) % promoImages.length;
+      fileId = promoImages[imageIndex].id;
+      title = PROMO_CAPTION;
+      dueAt = promoCandidateTime;
+      trackLabel = "PROMO";
+    }
+
+    const dueAtIso = dueAt.toISOString();
+
+    try {
+      await createPost({ channelId: CHANNEL_ID, fileId, title, dueAtIso });
+      console.log(`  (${trackLabel})`);
+      filled++;
+      consecutiveFailures = 0;
+    } catch (err) {
+      console.error(`Failed to schedule ${trackLabel} slot (${dueAtIso}): ${err.message}`);
+      consecutiveFailures++;
+      if (/limit/i.test(err.message)) {
+        console.log("Buffer reports the scheduled-post limit is reached. Stopping cleanly.");
+        break;
+      }
+      if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+        console.error(`Stopping after ${consecutiveFailures} consecutive failures.`);
+        break;
+      }
+    }
+
+    if (useMain) {
+      nextMainSlot++;
+    } else {
+      nextPromoSlot++;
+    }
   }
 
-  console.log("Done.");
+  console.log(`Run complete. ${filled} post(s) scheduled this run.`);
 }
 
 main().catch((err) => {
