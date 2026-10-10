@@ -47,8 +47,8 @@ const ORG_ID = requireEnv("BUFFER_ORG_ID");
 const CHANNEL_ID = requireEnv("BUFFER_CHANNEL_ID");
 const DRIVE_API_KEY = requireEnv("GOOGLE_DRIVE_API_KEY");
 const MAIN_ROOT_FOLDER_ID = requireEnv("ROOT_FOLDER_ID");
-const PROMO_ROOT_FOLDER_ID = requireEnv("PROMO_ROOT_FOLDER_ID");
-const PROMO_CAPTION = requireEnv("PROMO_CAPTION");
+const PROMO_ROOT_FOLDER_ID = process.env.PROMO_ROOT_FOLDER_ID || ""; // PROMO is retired: leave unset
+const PROMO_CAPTION = process.env.PROMO_CAPTION || "__PROMO_RETIRED__";
 
 const MAIN_CAPTION = process.env.MAIN_CAPTION || "";
 const MAIN_INTERVAL_HOURS = parseInt(process.env.MAIN_INTERVAL_HOURS || "6", 10);
@@ -261,7 +261,7 @@ async function main() {
 
   const [mainImages, promoImages] = await Promise.all([
     listDriveImages(MAIN_ROOT_FOLDER_ID),
-    listDriveImages(PROMO_ROOT_FOLDER_ID),
+    PROMO_ROOT_FOLDER_ID ? listDriveImages(PROMO_ROOT_FOLDER_ID) : Promise.resolve([]),
   ]);
   console.log(`MAIN track: ${mainImages.length} images. PROMO track: ${promoImages.length} images.`);
 
