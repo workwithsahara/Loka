@@ -33,7 +33,5 @@ jobs:
           BUFFER_CHANNEL_ID: ${{ secrets.BUFFER_CHANNEL_ID }}
           GOOGLE_DRIVE_API_KEY: ${{ secrets.GOOGLE_DRIVE_API_KEY }}
           ROOT_FOLDER_ID: ${{ secrets.ROOT_FOLDER_ID }}
-          PROMO_ROOT_FOLDER_ID: ${{ secrets.PROMO_ROOT_FOLDER_ID }}
-          PROMO_CAPTION: ${{ secrets.PROMO_CAPTION }}
           DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
         run: node schedule-loka-posts.js
