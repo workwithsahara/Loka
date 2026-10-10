@@ -76,6 +76,22 @@ const STORY_LINK_LINE = "Pick a time at laya365.com/contact";
 const STORY_DM_LINE = "Send us a DM and we'll find a time.";
 const STORY_WITH_IMAGE = true;
 const STORY_IMAGE_URL = "https://raw.githubusercontent.com/workwithsahara/laya-meta-buffer-scheduler/main/laya-story-image.jpg";
+
+// Instagram and TikTok story posts now use a 10 second video (laya-story-video.mp4 in the
+// laya-meta-buffer-scheduler repo). If the video is not reachable the still image is used, so
+// no post is ever missed. Posts already in the queue with the image are upgraded to the video.
+const STORY_VIDEO_URL = "https://raw.githubusercontent.com/workwithsahara/laya-meta-buffer-scheduler/main/laya-story-video.mp4";
+let STORY_VIDEO_READY = false;
+async function checkStoryVideo() {
+  try {
+    const res = await fetch(STORY_VIDEO_URL, { method: "HEAD" });
+    STORY_VIDEO_READY = res.ok;
+  } catch (e) {
+    STORY_VIDEO_READY = false;
+  }
+  console.log(`STORY media: ${STORY_VIDEO_READY ? "video found, Instagram/TikTok story posts will be video" : "video NOT found, using the image"}.`);
+}
+function storyMedia() { return STORY_VIDEO_READY ? STORY_VIDEO_URL : STORY_IMAGE_URL; }
 const STORY_HOOKS = [
   "Did I get your attention?",
   "Okay, now that I have you.",
@@ -200,15 +216,57 @@ async function getScheduledPosts(channelId) {
   const query = `
     query Posts($organizationId: OrganizationId!, $channelIds: [ChannelId!]) {
       posts(input: { organizationId: $organizationId, filter: { channelIds: $channelIds, status: [scheduled] } }, first: 100) {
-        edges { node { dueAt text } }
+        edges { node { id dueAt text assets { type } } }
       }
     }
   `;
   const data = await bufferRequest(query, { organizationId: ORG_ID, channelIds: [channelId] });
   return data.posts.edges.map((e) => ({
+    id: e.node.id,
     dueAt: new Date(e.node.dueAt),
     text: e.node.text || "",
+    hasVideo: (e.node.assets || []).some((a) => a.type === "video"),
   }));
+}
+
+// Swap the still image for the video on story posts that are already queued.
+async function upgradeQueuedStories(posts) {
+  if (!STORY_VIDEO_READY) return;
+  const todo = posts.filter((p) => p.id && isStory(p.text) && !p.hasVideo && p.dueAt.getTime() > Date.now() + 15 * 60 * 1000);
+  if (todo.length === 0) return;
+  console.log(`Upgrading ${todo.length} queued story post(s) from image to video.`);
+  const mutation = `
+    mutation EditPost($input: EditPostInput!) {
+      editPost(input: $input) {
+        ... on PostActionSuccess { post { id } }
+        ... on InvalidInputError { message }
+        ... on UnexpectedError { message }
+        ... on NotFoundError { message }
+        ... on UnauthorizedError { message }
+        ... on LimitReachedError { message }
+      }
+    }
+  `;
+  for (const p of todo) {
+    const input = {
+      id: p.id,
+      assets: [{ video: { url: STORY_VIDEO_URL } }],
+      mode: "customScheduled",
+      schedulingType: "automatic",
+      dueAt: p.dueAt.toISOString(),
+    };
+    if (DRY_RUN) {
+      console.log(`[DRY RUN] Would upgrade post ${p.id} (${p.dueAt.toISOString()}) to video.`);
+      continue;
+    }
+    try {
+      const data = await bufferRequest(mutation, { input });
+      if (data.editPost && data.editPost.message) throw new Error(data.editPost.message);
+      console.log(`Upgraded post ${p.id} (${p.dueAt.toISOString()}) to video.`);
+    } catch (err) {
+      console.error(`Could not upgrade post ${p.id}: ${err.message}. It stays as the image.`);
+    }
+  }
 }
 
 async function createPost({ channelId, fileId, title, dueAtIso }) {
@@ -222,6 +280,7 @@ async function createPost({ channelId, fileId, title, dueAtIso }) {
       }
     }
   `;
+  const isVideo = typeof fileId === "string" && /\.mp4$/i.test(fileId);
   const input = {
     channelId,
     mode: "customScheduled",
@@ -229,12 +288,14 @@ async function createPost({ channelId, fileId, title, dueAtIso }) {
     dueAt: dueAtIso,
     text: title,
     assets: [
-      {
-        image: {
-          url: /^https?:/.test(fileId) ? fileId : `https://lh3.googleusercontent.com/d/${fileId}`,
-          metadata: { altText: title || "Loka" },
-        },
-      },
+      isVideo
+        ? { video: { url: fileId } }
+        : {
+            image: {
+              url: /^https?:/.test(fileId) ? fileId : `https://lh3.googleusercontent.com/d/${fileId}`,
+              metadata: { altText: title || "Loka" },
+            },
+          },
     ],
     // TikTok doesn't require an explicit "type" the way Facebook/Instagram do.
   };
@@ -250,11 +311,26 @@ async function createPost({ channelId, fileId, title, dueAtIso }) {
   console.log(`Scheduled: dueAt=${dueAtIso} caption="${title}" -> post ${payload.post.id}`);
 }
 
+// If Buffer rejects the story video, post the image instead so the day is not missed.
+async function createPostWithFallback(args) {
+  try {
+    await createPost(args);
+  } catch (err) {
+    if (args.fileId === STORY_VIDEO_URL && !/limit/i.test(err.message)) {
+      console.warn(`Story video was rejected (${err.message}). Posting the image instead.`);
+      await createPost({ ...args, fileId: STORY_IMAGE_URL });
+    } else {
+      throw err;
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 async function main() {
   console.log(`Run started ${new Date().toISOString()}${DRY_RUN ? " [DRY RUN]" : ""}`);
+  await checkStoryVideo();
 
   const mainTrack = makeTrack(MAIN_INTERVAL_HOURS);
   const promoTrack = makeTrack(PROMO_INTERVAL_HOURS);
@@ -269,6 +345,7 @@ async function main() {
   console.log(`Buffer scheduled-post limit for this channel: ${limit}`);
 
   const scheduled = await getScheduledPosts(CHANNEL_ID);
+  await upgradeQueuedStories(scheduled);
   const storyScheduled = scheduled.filter((p) => isStory(p.text));
   const mainScheduled = scheduled.filter((p) => p.text !== PROMO_CAPTION && !isStory(p.text));
   const promoScheduled = scheduled.filter((p) => p.text === PROMO_CAPTION);
@@ -323,7 +400,7 @@ async function main() {
 
     let fileId, title, dueAt, trackLabel;
     if (useStory) {
-      fileId = STORY_IMAGE_URL;
+      fileId = storyMedia();
       title = storyText(nextStorySlot);
       dueAt = storyTime;
       trackLabel = "STORY";
@@ -344,7 +421,7 @@ async function main() {
     const dueAtIso = dueAt.toISOString();
 
     try {
-      await createPost({ channelId: CHANNEL_ID, fileId, title, dueAtIso });
+      await createPostWithFallback({ channelId: CHANNEL_ID, fileId, title, dueAtIso });
       console.log(`  (${trackLabel})`);
       filled++;
       consecutiveFailures = 0;
