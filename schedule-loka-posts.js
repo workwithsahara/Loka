@@ -367,12 +367,43 @@ async function createPostWithFallback(args) {
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
+// After a story is posted now, remove any copy of the same story that is still queued for its normal
+// slot, so the story does not go out twice.
+async function deleteQueuedStorySlot(channelId, slot) {
+  let posts;
+  try {
+    posts = await getScheduledPosts(channelId);
+  } catch (err) {
+    console.error(`Could not check queued stories for ${channelId}: ${err.message}`);
+    return;
+  }
+  const dupes = posts.filter((p) => p.id && isStory(p.text) && storySlotForTime(p.dueAt) === slot);
+  const mutation = `
+    mutation DeletePost($input: DeletePostInput!) {
+      deletePost(input: $input) {
+        ... on DeletePostSuccess { id }
+        ... on VoidMutationError { message }
+      }
+    }
+  `;
+  for (const p of dupes) {
+    try {
+      const data = await bufferRequest(mutation, { input: { id: p.id } });
+      if (data.deletePost && data.deletePost.message) throw new Error(data.deletePost.message);
+      console.log(`Removed queued copy ${p.id} (${p.dueAt.toISOString()}) so the story is not posted twice.`);
+    } catch (err) {
+      console.error(`Could not remove queued copy ${p.id}: ${err.message}`);
+    }
+  }
+}
+
 async function postStoryNow() {
   const slot = parseInt(process.env.POST_NOW_STORY, 10);
   const title = storyText(slot);
   console.log(`POST NOW (story slot ${slot}), media: ${storyMedia()}`);
   await createPostWithFallback({ channelId: CHANNEL_ID, fileId: storyMedia(), title, dueAtIso: new Date().toISOString() });
   console.log("POSTED NOW to Loka TikTok");
+      await deleteQueuedStorySlot(channelId, slot);
 }
 
 async function main() {
@@ -416,7 +447,7 @@ async function main() {
   let nextPromoSlot = Math.max(nowPromoSlot, latestPromoSlot + 1);
 
   // STORY candidates: next empty daily slot on the fixed 11 PM Manila grid.
-  const nowStorySlot = Math.max(0, Math.ceil((Date.now() + LEAD_BUFFER_MS - STORY_EPOCH_START.getTime()) / STORY_INTERVAL_MS));
+  const nowStorySlot = Math.max(1, Math.ceil((Date.now() + LEAD_BUFFER_MS - STORY_EPOCH_START.getTime()) / STORY_INTERVAL_MS));
   const latestStorySlot = storyScheduled.length
     ? Math.max(...storyScheduled.map((p) => storySlotForTime(p.dueAt)))
     : -1;
