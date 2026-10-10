@@ -400,10 +400,12 @@ async function deleteQueuedStorySlot(channelId, slot) {
 async function postStoryNow() {
   const slot = parseInt(process.env.POST_NOW_STORY, 10);
   const title = storyText(slot);
-  console.log(`POST NOW (story slot ${slot}), media: ${storyMedia()}`);
-  await createPostWithFallback({ channelId: CHANNEL_ID, fileId: storyMedia(), title, dueAtIso: new Date().toISOString() });
-  console.log("POSTED NOW to Loka TikTok");
-      await deleteQueuedStorySlot(channelId, slot);
+  if (!process.env.POST_NOW_CLEANUP_ONLY) {
+    console.log(`POST NOW (story slot ${slot}), media: ${storyMedia()}`);
+    await createPostWithFallback({ channelId: CHANNEL_ID, fileId: storyMedia(), title, dueAtIso: new Date().toISOString() });
+    console.log("POSTED NOW to Loka TikTok");
+  }
+  await deleteQueuedStorySlot(CHANNEL_ID, slot);
 }
 
 async function main() {
