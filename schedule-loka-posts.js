@@ -299,6 +299,7 @@ async function createPost({ channelId, fileId, title, dueAtIso }) {
     ],
     // TikTok doesn't require an explicit "type" the way Facebook/Instagram do.
   };
+  if (process.env.POST_NOW_STORY) { input.mode = "shareNow"; delete input.dueAt; }
   if (DRY_RUN) {
     console.log(`[DRY RUN] Would create post: dueAt=${dueAtIso} caption="${title}"`);
     return;
@@ -328,9 +329,18 @@ async function createPostWithFallback(args) {
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
+async function postStoryNow() {
+  const slot = parseInt(process.env.POST_NOW_STORY, 10);
+  const title = storyText(slot);
+  console.log(`POST NOW (story slot ${slot}), media: ${storyMedia()}`);
+  await createPostWithFallback({ channelId: CHANNEL_ID, fileId: storyMedia(), title, dueAtIso: new Date().toISOString() });
+  console.log("POSTED NOW to Loka TikTok");
+}
+
 async function main() {
   console.log(`Run started ${new Date().toISOString()}${DRY_RUN ? " [DRY RUN]" : ""}`);
   await checkStoryVideo();
+  if (process.env.POST_NOW_STORY) { await postStoryNow(); return; }
 
   const mainTrack = makeTrack(MAIN_INTERVAL_HOURS);
   const promoTrack = makeTrack(PROMO_INTERVAL_HOURS);
