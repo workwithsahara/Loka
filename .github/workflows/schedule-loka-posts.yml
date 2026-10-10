@@ -22,6 +22,10 @@ jobs:
         with:
           node-version: "20"
 
+      - name: Fetch story posts
+        run: |
+          for i in 1 2 3 4; do curl -fsSL -o story-365-part$i.json https://raw.githubusercontent.com/workwithsahara/laya-meta-buffer-scheduler/main/story-365-part$i.json; done
+
       - name: Run scheduler
         env:
           BUFFER_API_KEY: ${{ secrets.BUFFER_API_KEY }}
