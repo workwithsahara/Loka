@@ -63,6 +63,59 @@ const LEAD_BUFFER_MS = 5 * 60 * 1000; // 5-minute lead so dueAt is always in the
 
 const BUFFER_GRAPHQL_URL = "https://api.buffer.com/graphql";
 
+// ---------------------------------------------------------------------------
+// STORY track: one "LAYA 365 story" post per day at 11:00 PM Manila, read from
+// story-365-part1..4.json (365 posts written with the booking link, repeating
+// every 365 days; the workflow downloads the files before the script runs).
+// Stateless like the other tracks: the post is picked from a fixed daily grid,
+// nothing is stored. Instagram-style: image post with the story as caption, hook line first, DM line instead of a link.
+// ---------------------------------------------------------------------------
+const fs = require("fs");
+const path = require("path");
+const STORY_LINK_LINE = "Pick a time at laya365.com/contact";
+const STORY_DM_LINE = "Send us a DM and we'll find a time.";
+const STORY_WITH_IMAGE = true;
+const STORY_IMAGE_URL = "https://raw.githubusercontent.com/workwithsahara/laya-meta-buffer-scheduler/main/laya-story-image.jpg";
+const STORY_HOOKS = [
+  "Did I get your attention?",
+  "Okay, now that I have you.",
+  "Scary, right? Not as scary as a page that went quiet.",
+];
+let STORY_POSTS = [];
+for (let i = 1; i <= 4; i++) {
+  try {
+    STORY_POSTS = STORY_POSTS.concat(JSON.parse(fs.readFileSync(path.join(__dirname, `story-365-part${i}.json`), "utf8")));
+  } catch (err) {
+    console.warn(`STORY: could not load story-365-part${i}.json (${err.message}). Track disabled.`);
+    STORY_POSTS = [];
+    break;
+  }
+}
+const STORY_SET = new Set();
+STORY_POSTS.forEach((t) => {
+  STORY_SET.add(t.trim());
+  STORY_SET.add(t.split(STORY_LINK_LINE).join(STORY_DM_LINE).trim());
+});
+const STORY_EPOCH_START = new Date("2026-10-10T15:00:00Z"); // 11:00 PM Manila. Never change once live.
+const STORY_START_INDEX = 0; // index of the story posted in slot 0
+const STORY_INTERVAL_MS = 24 * 60 * 60 * 1000;
+function isStory(text) {
+  let t = (text || "").trim();
+  for (const h of STORY_HOOKS) {
+    if (t.startsWith(h + "\n\n")) { t = t.slice(h.length).trim(); break; }
+  }
+  return STORY_SET.has(t);
+}
+function storyTimeForSlot(slot) { return new Date(STORY_EPOCH_START.getTime() + slot * STORY_INTERVAL_MS); }
+function storySlotForTime(date) { return Math.round((date.getTime() - STORY_EPOCH_START.getTime()) / STORY_INTERVAL_MS); }
+function storyIndexForSlot(slot) { return (((STORY_START_INDEX + slot) % STORY_POSTS.length) + STORY_POSTS.length) % STORY_POSTS.length; }
+function storyText(slot) {
+  const idx = storyIndexForSlot(slot);
+  const t = STORY_POSTS[idx];
+  if (!STORY_WITH_IMAGE) return t;
+  return STORY_HOOKS[idx % STORY_HOOKS.length] + "\n\n" + t.split(STORY_LINK_LINE).join(STORY_DM_LINE);
+}
+
 function requireEnv(name) {
   const v = process.env[name];
   if (!v) {
@@ -178,7 +231,7 @@ async function createPost({ channelId, fileId, title, dueAtIso }) {
     assets: [
       {
         image: {
-          url: `https://lh3.googleusercontent.com/d/${fileId}`,
+          url: /^https?:/.test(fileId) ? fileId : `https://lh3.googleusercontent.com/d/${fileId}`,
           metadata: { altText: title || "Loka" },
         },
       },
@@ -216,11 +269,12 @@ async function main() {
   console.log(`Buffer scheduled-post limit for this channel: ${limit}`);
 
   const scheduled = await getScheduledPosts(CHANNEL_ID);
-  const mainScheduled = scheduled.filter((p) => p.text !== PROMO_CAPTION);
+  const storyScheduled = scheduled.filter((p) => isStory(p.text));
+  const mainScheduled = scheduled.filter((p) => p.text !== PROMO_CAPTION && !isStory(p.text));
   const promoScheduled = scheduled.filter((p) => p.text === PROMO_CAPTION);
   console.log(
     `Channel ${CHANNEL_ID}: ${scheduled.length}/${limit} total slots used ` +
-      `(MAIN: ${mainScheduled.length}, PROMO: ${promoScheduled.length}).`
+      `(MAIN: ${mainScheduled.length}, PROMO: ${promoScheduled.length}, STORY: ${storyScheduled.length}).`
   );
 
   const nowMainSlot = Math.ceil((Date.now() + LEAD_BUFFER_MS - EPOCH_START.getTime()) / mainTrack.intervalMs);
@@ -236,6 +290,14 @@ async function main() {
   let nextMainSlot = Math.max(nowMainSlot, latestMainSlot + 1);
   let nextPromoSlot = Math.max(nowPromoSlot, latestPromoSlot + 1);
 
+  // STORY candidates: next empty daily slot on the fixed 11 PM Manila grid.
+  const nowStorySlot = Math.max(0, Math.ceil((Date.now() + LEAD_BUFFER_MS - STORY_EPOCH_START.getTime()) / STORY_INTERVAL_MS));
+  const latestStorySlot = storyScheduled.length
+    ? Math.max(...storyScheduled.map((p) => storySlotForTime(p.dueAt)))
+    : -1;
+  let nextStorySlot = Math.max(nowStorySlot, latestStorySlot + 1);
+  let storyFailed = false;
+
   const slotsToFill = limit - scheduled.length;
   if (slotsToFill <= 0) {
     console.log("Channel already at its scheduled-post limit. Nothing to add this run.");
@@ -249,14 +311,23 @@ async function main() {
 
   while (filled < slotsToFill) {
     const mainCandidateTime = mainTrack.timeForSlotIndex(nextMainSlot);
-    const promoCandidateTime = promoTrack.timeForSlotIndex(nextPromoSlot);
+    // With no PROMO images the PROMO track is simply off (never picked).
+    const promoCandidateTime = promoImages.length > 0 ? promoTrack.timeForSlotIndex(nextPromoSlot) : new Date(8.64e15);
 
     // Whichever track's next slot is chronologically earlier goes first —
     // this is what naturally interleaves the two cadences into one queue.
     const useMain = mainCandidateTime.getTime() <= promoCandidateTime.getTime();
 
+    const storyTime = STORY_POSTS.length > 0 && !storyFailed ? storyTimeForSlot(nextStorySlot) : null;
+    const useStory = storyTime !== null && storyTime.getTime() < Math.min(mainCandidateTime.getTime(), promoCandidateTime.getTime());
+
     let fileId, title, dueAt, trackLabel;
-    if (useMain) {
+    if (useStory) {
+      fileId = STORY_IMAGE_URL;
+      title = storyText(nextStorySlot);
+      dueAt = storyTime;
+      trackLabel = "STORY";
+    } else if (useMain) {
       const imageIndex = ((nextMainSlot % mainImages.length) + mainImages.length) % mainImages.length;
       fileId = mainImages[imageIndex].id;
       title = MAIN_CAPTION;
@@ -279,6 +350,11 @@ async function main() {
       consecutiveFailures = 0;
     } catch (err) {
       console.error(`Failed to schedule ${trackLabel} slot (${dueAtIso}): ${err.message}`);
+      if (trackLabel === "STORY" && !/limit/i.test(err.message)) {
+        storyFailed = true;
+        console.error("  STORY track paused for the rest of this run.");
+        continue;
+      }
       consecutiveFailures++;
       if (/limit/i.test(err.message)) {
         console.log("Buffer reports the scheduled-post limit is reached. Stopping cleanly.");
@@ -290,7 +366,9 @@ async function main() {
       }
     }
 
-    if (useMain) {
+    if (useStory) {
+      nextStorySlot++;
+    } else if (useMain) {
       nextMainSlot++;
     } else {
       nextPromoSlot++;
