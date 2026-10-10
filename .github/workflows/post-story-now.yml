@@ -32,4 +32,5 @@ jobs:
           ROOT_FOLDER_ID: ${{ secrets.ROOT_FOLDER_ID }}
           DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
           POST_NOW_STORY: "0"
+          POST_NOW_CLEANUP_ONLY: "1"
         run: node schedule-loka-posts.js
