@@ -1,0 +1,44 @@
+name: Post daily LAYA stories
+on:
+  schedule:
+    # 13:00 UTC = 9:00 PM Manila. GitHub can start scheduled jobs late; the same day is fine.
+    - cron: "0 13 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (log only, don't post)"
+        type: boolean
+        default: false
+permissions:
+  contents: read
+  actions: read
+jobs:
+  post-stories:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Skip if a scheduled run already posted today
+        id: guard
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          n=$(gh api -X GET "repos/${{ github.repository }}/actions/workflows/daily-stories.yml/runs" -f status=success -f event=schedule -f created=">=$(date -u +%F)" --jq '.total_count')
+          echo "Successful scheduled runs today: $n"
+          if [ "$n" -gt 0 ]; then echo "skip=true" >> "$GITHUB_OUTPUT"; fi
+      - uses: actions/setup-node@v4
+        if: steps.guard.outputs.skip != 'true'
+        with:
+          node-version: "20"
+      - name: Fetch story poster
+        if: steps.guard.outputs.skip != 'true'
+        run: curl -fsSL -o post-daily-stories.js https://raw.githubusercontent.com/workwithsahara/laya-meta-buffer-scheduler/main/post-daily-stories.js
+      - name: Post stories
+        if: steps.guard.outputs.skip != 'true'
+        env:
+          BUFFER_API_KEY: ${{ secrets.BUFFER_API_KEY }}
+          BUFFER_ORG_ID: ${{ secrets.BUFFER_ORG_ID }}
+          BUFFER_CHANNEL_ID: ${{ secrets.BUFFER_CHANNEL_ID }}
+          GOOGLE_DRIVE_API_KEY: ${{ secrets.GOOGLE_DRIVE_API_KEY }}
+          STORY_SERVICES: "tiktok"
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+        run: node post-daily-stories.js
