@@ -1,8 +1,8 @@
 name: Post daily LAYA stories
 on:
   schedule:
-    # 13:00 UTC = 9:00 PM Manila. GitHub can start scheduled jobs late; the same day is fine.
-    - cron: "0 13 * * *"
+    # 13:00 UTC = 9:00 PM Manila. GitHub can drop or delay scheduled jobs, so retry at 15:00 and 17:00 UTC; the guard step skips if one already succeeded.
+    - cron: "0 13,15,17 * * *"
   workflow_dispatch:
     inputs:
       dry_run:
