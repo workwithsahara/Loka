@@ -434,6 +434,7 @@ async function main() {
 
   const scheduled = await getScheduledPosts(CHANNEL_ID);
   await upgradeQueuedStories(scheduled);
+  await AV.swapQueued({ bufferRequest, orgId: ORG_ID, channelId: CHANNEL_ID, service: "tiktok", dryRun: DRY_RUN });
   const storyScheduled = scheduled.filter((p) => isStory(p.text));
   const mainScheduled = scheduled.filter((p) => p.text !== PROMO_CAPTION && !isStory(p.text));
   const promoScheduled = scheduled.filter((p) => p.text === PROMO_CAPTION);
