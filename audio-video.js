@@ -198,4 +198,65 @@ async function maybeVideo({ fileId, service, noAudio, dueAtIso }) {
   return fileId;
 }
 
-module.exports = { ENABLED, CAN_RENDER, AUDIO_SERVICES, getAudioVideoUrl, maybeVideo, mustWait };
+// Swaps already-queued quote IMAGE posts for their audio video, in place (same time, same caption).
+// Only touches posts whose image comes from Google Drive and that are due more than 3 hours away.
+// Stories, text posts and posts that already carry a video are left alone.
+async function swapQueued({ bufferRequest, orgId, channelId, service, dryRun }) {
+  if (!ENABLED || !AUDIO_SERVICES.has(service)) return;
+  const query = `
+    query Posts($organizationId: OrganizationId!, $channelIds: [ChannelId!]) {
+      posts(input: { organizationId: $organizationId, filter: { channelIds: $channelIds, status: [scheduled] } }, first: 100) {
+        edges { node { id dueAt assets { type ... on ImageAsset { source } } } }
+      }
+    }`;
+  let edges;
+  try {
+    edges = (await bufferRequest(query, { organizationId: orgId, channelIds: [channelId] })).posts.edges;
+  } catch (e) {
+    console.warn(`AUDIO VIDEO: could not read queued posts (${e.message}).`);
+    return;
+  }
+  const todo = [];
+  for (const { node } of edges) {
+    const assets = node.assets || [];
+    if (assets.length !== 1 || assets[0].type !== "image") continue;
+    const m = /googleusercontent\.com\/d\/([A-Za-z0-9_-]+)/.exec(assets[0].source || "");
+    if (!m) continue;
+    const due = new Date(node.dueAt);
+    if (due.getTime() < Date.now() + 3 * 3600 * 1000) continue;
+    todo.push({ id: node.id, due, fileId: m[1] });
+  }
+  if (todo.length === 0) return;
+  console.log(`AUDIO VIDEO: swapping ${todo.length} queued image post(s) for audio videos.`);
+  const mutation = `
+    mutation EditPost($input: EditPostInput!) {
+      editPost(input: $input) {
+        ... on PostActionSuccess { post { id } }
+        ... on InvalidInputError { message }
+        ... on UnexpectedError { message }
+        ... on NotFoundError { message }
+        ... on UnauthorizedError { message }
+        ... on LimitReachedError { message }
+      }
+    }`;
+  let done = 0;
+  for (const p of todo) {
+    try {
+      const url = await getAudioVideoUrl(p.fileId);
+      if (!url) { console.log(`  Video not ready for post ${p.id}, leaving the image for now.`); continue; }
+      const input = { id: p.id, assets: [{ video: { url } }], mode: "customScheduled", schedulingType: "automatic", dueAt: p.due.toISOString() };
+      if (service === "instagram") input.metadata = { instagram: { type: "reel", shouldShareToFeed: true } };
+      else if (service === "facebook") input.metadata = { facebook: { type: "post" } };
+      if (dryRun) { console.log(`  [DRY RUN] Would swap post ${p.id} (${p.due.toISOString()}) to video.`); continue; }
+      const data = await bufferRequest(mutation, { input });
+      if (data.editPost && data.editPost.message) throw new Error(data.editPost.message);
+      done++;
+      console.log(`  Swapped post ${p.id} (${p.due.toISOString()}) to video.`);
+    } catch (e) {
+      console.warn(`  Could not swap post ${p.id}: ${e.message}. It stays as the image.`);
+    }
+  }
+  if (!dryRun) console.log(`AUDIO VIDEO: swapped ${done}/${todo.length}.`);
+}
+
+module.exports = { ENABLED, CAN_RENDER, AUDIO_SERVICES, getAudioVideoUrl, maybeVideo, mustWait, swapQueued };
