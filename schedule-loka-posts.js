@@ -307,7 +307,10 @@ async function upgradeQueuedStories(posts) {
   }
 }
 
-async function createPost({ channelId, fileId, title, dueAtIso }) {
+const AV = require("./audio-video");
+
+async function createPost({ channelId, service = "tiktok", fileId, title, dueAtIso, noAudio }) {
+  fileId = await AV.maybeVideo({ fileId, service, noAudio, dueAtIso });
   const mutation = `
     mutation CreatePost($input: CreatePostInput!) {
       createPost(input: $input) {
@@ -358,6 +361,10 @@ async function createPostWithFallback(args) {
     if (args.fileId === STORY_VIDEO_URL && !/limit/i.test(err.message)) {
       console.warn(`Story video was rejected (${err.message}). Posting the image instead.`);
       await createPost({ ...args, fileId: STORY_IMAGE_URL });
+    } else if (!args.noAudio && AV.ENABLED && AV.AUDIO_SERVICES.has(args.service || "tiktok") && typeof args.fileId === "string" && !/^https?:/.test(args.fileId) && !/limit|AV_NOT_READY/i.test(err.message)) {
+      // The audio video was rejected by Buffer: post the plain image so the day is not missed.
+      console.warn(`Audio video was rejected (${err.message}). Posting the plain image instead.`);
+      await createPost({ ...args, noAudio: true });
     } else {
       throw err;
     }
